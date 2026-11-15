@@ -13,15 +13,18 @@ MIN_LOAD_SHARE = 0.9
 LOAD_PENALTY = 50
 VEHICLE_FIXED = 100000
 TIME_LIMIT_S = 300
-MERGE_SAME_ADDRESS = True
+MERGE_SAME_ADDRESS = False
 DROP_PENALTY = 10_000_000
 FLEET = {4000: 5, 3700: 2, 4800: 1, 4600: 4, 5000: 2, 2800: 1, 1500: 1}
 
-loc = pd.read_csv("locations.csv", encoding="utf-8-sig")
+loc = pd.read_csv("locations_agg.csv", encoding="utf-8-sig")
 columns = list(loc.columns)
 ORG, ADDRESS, LAT, LON, DEMAND, FIXED, SMALL_ONLY = columns[1:8]
 T = (np.loadtxt("time_matrix_sec.csv", delimiter=",") / 60).round().astype(int)
 D = np.loadtxt("distance_matrix_m.csv", delimiter=",").round().astype(int)
+
+if "service_objects" not in loc.columns:
+    loc["service_objects"] = 1
 
 if MERGE_SAME_ADDRESS:
     grouped = loc.groupby([LAT, LON], sort=False)
@@ -71,6 +74,7 @@ for node, row in loc.iterrows():
         earliest = max(0, int(row[FIXED]) - SHIFT_START_MIN)
         latest = earliest + FIXED_TOL_MIN
     time_dimension.CumulVar(manager.NodeToIndex(node)).SetRange(earliest, latest)
+
 for vehicle in range(vehicle_count):
     start, end = routing.Start(vehicle), routing.End(vehicle)
     time_dimension.CumulVar(start).SetRange(0, HORIZON_MIN)

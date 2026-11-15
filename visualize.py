@@ -13,7 +13,7 @@ def minutes(value):
 
 
 def build(folder):
-    locations = pd.read_csv(folder / "locations.csv", encoding="utf-8-sig")
+    locations = pd.read_csv(folder / "locations_agg.csv", encoding="utf-8-sig")
     routes = pd.read_csv(folder / "routes.csv", encoding="utf-8-sig")
     grouped = "формат" in routes.columns and len(routes) > 0 and bool((routes["формат"] == 3).all())
     strict = "формат" in routes.columns and len(routes) > 0 and bool((routes["формат"].isin([2, 3])).all())

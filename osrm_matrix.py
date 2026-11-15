@@ -10,7 +10,7 @@ ap.add_argument("--url", default="https://router.project-osrm.org")
 ap.add_argument("--block", type=int, default=45)   # источники+назначения в запросе <= 100 (лимит демо-сервера)
 a = ap.parse_args()
 
-loc = pd.read_csv("locations.csv", encoding="utf-8-sig")
+loc = pd.read_csv("locations_agg.csv", encoding="utf-8-sig")
 coords = list(zip(loc["lon"], loc["lat"]))          # OSRM: долгота,широта
 n = len(coords)
 dur = np.zeros((n, n)); dist = np.zeros((n, n))
