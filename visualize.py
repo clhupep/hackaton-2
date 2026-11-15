@@ -1,4 +1,4 @@
-﻿"""Build an offline dashboard and audit the saved routes: python visualize.py."""
+"""Build an offline dashboard and audit the saved routes: python visualize.py."""
 import argparse
 import json
 from pathlib import Path
@@ -61,7 +61,7 @@ def build(folder):
             windows = [int(value) for value in members.fixed_time_min.dropna()]
             fixed_warnings = []
             if grouped and not windows and node_id and not DEFAULT_OPEN_MIN <= start <= DEFAULT_CLOSE_MIN:
-                fixed_warnings.append("Вне окна 08:00–14:00")
+                fixed_warnings.append("Вне окна 08:00–16:00")
             if any(not target <= start <= target + 30 for target in windows):
                 fixed_warnings.append("Нарушено даже допущение окна [T, T+30]")
             if any(start != target for target in windows):
@@ -91,12 +91,16 @@ def build(folder):
         duration = end - stops[0]["time"]
         if grouped and end > DEPOT_CLOSE_MIN:
             route_warnings.append("Возврат после 18:00")
+        if duration < 360:
+            route_warnings.append(f"Смена короче целевых 6 часов: {duration / 60:.2f} ч")
         if duration > 480:
             route_warnings.append(f"Смена с учётом разгрузок: минимум {duration / 60:.2f} ч > 8 ч")
         load = sum(stop["kg"] for stop in stops)
         cap = int(route.iloc[0][capacity])
         if not 0.9 * cap <= load <= cap:
             route_warnings.append("Загрузка вне обязательных 90–100%")
+        if load > cap:
+            route_warnings.append("Превышена грузоподъёмность")
         if any(stop["issues"] for stop in stops):
             route_warnings.append("Есть замечания к расписанию остановок")
         results.append(dict(vehicle=int(vehicle_id), capacity=cap, kg=load, load=round(100 * load / cap, 1), km=round(kilometers, 2), start=stops[0]["time"], end=round(end, 1), model_end=model_end, duration=round(duration, 1), stops=stops, issues=route_warnings))
@@ -112,9 +116,9 @@ def build(folder):
         "Нижняя оценка числа машин: 16. Пятнадцать самых вместительных машин перевозят 63 400 кг, а спрос составляет 63 630 кг.",
     ])
     if strict:
-        warnings = ["Каждый объект обслуживается отдельно 30 минут; точное начало выгрузки; все заказы обязательны; загрузка 90–100%; смена до 8 часов.", "Время дороги округляется до ближайшей минуты.", "Линии показывают порядок остановок, без геометрии дорог. Координаты депо требуют подтверждения.", "Результат Excel: result.xlsx. Ранние выезды являются допущением; см. лист условий."]
+        warnings = ["Каждый объект обслуживается отдельно 30 минут; точное начало выгрузки; все заказы обязательны; загрузка до грузоподъёмности; смена до 8 часов.", "Время дороги округляется до ближайшей минуты.", "Линии показывают порядок остановок, без геометрии дорог. Координаты депо требуют подтверждения.", "Результат Excel: result.xlsx. Ранние выезды являются допущением; см. лист условий."]
     if grouped:
-        warnings = ["30 минут на адрес для всех организаций; точное время любой организации действует на адрес; иначе окно 08:00–14:00. Прибытие в 14:00 разрешено, разгрузка может закончиться позже.", "Все заказы обязательны; загрузка 90–100%; смена до 8 часов; возврат до 18:00.", "Время дороги округляется до ближайшей минуты; геометрия дорог на схеме не показана.", "Результат Excel: result.xlsx. Координаты депо и ранний выезд требуют подтверждения."]
+        warnings = ["30 минут на адрес для всех организаций; точное время любой организации действует на адрес; иначе окно 08:00–16:00. Разгрузка должна начаться не позже 16:00.", "Все заказы обязательны; загрузка не выше грузоподъёмности; смена до 8 часов, возможны повторные рейсы с загрузкой в депо; возврат до 18:00.", "Время дороги округляется до ближайшей минуты; геометрия дорог на схеме не показана.", "Результат Excel: result.xlsx. Координаты депо и ранний выезд требуют подтверждения."]
     payload = dict(routes=results, warnings=warnings, total_kg=int(locations.demand_kg.sum()), delivered_kg=sum(route["kg"] for route in results), total_objects=len(locations)-1, served_objects=len(visited), unserved=[dict(id=int(row.id), name=str(row.iloc[1]), lat=float(row.lat), lon=float(row.lon), kg=int(row.demand_kg)) for _, row in unserved.iterrows()], total_km=round(sum(route["km"] for route in results), 1))
     return payload
 
@@ -143,5 +147,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

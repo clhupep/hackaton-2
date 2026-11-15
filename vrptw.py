@@ -1,21 +1,25 @@
-"""Vehicle routing with time windows. Run: python vrptw.py"""
+"""Vehicle routing with time windows using PyVRP's Hybrid Genetic Search."""
 import numpy as np
 import pandas as pd
-from ortools.constraint_solver import pywrapcp, routing_enums_pb2
+from pyvrp import Model
+from pyvrp.stop import MaxRuntime
 
-SHIFT_START_MIN = 5 * 60 + 30
-HORIZON_MIN = 10 * 60 + 30
-MAX_ROUTE_MIN = 8 * 60
+SHIFT_START_MIN = 330
+HORIZON_MIN = 630
+MAX_ROUTE_MIN = 480
+MIN_ROUTE_MIN = 360
 FIXED_TOL_MIN = 0
 SERVICE_MIN = 30
-SERVICE_KG_STEP = 200
-MIN_LOAD_SHARE = 0.9
-LOAD_PENALTY = 50
-VEHICLE_FIXED = 100000
 TIME_LIMIT_S = 300
-MERGE_SAME_ADDRESS = True
-DROP_PENALTY = 10_000_000
+NUM_RUNS = 3                    # fewer, longer runs converge to shorter routes (was 6)
+SEED = 42
+VEHICLE_FIXED = 100_000
 FLEET = {4000: 5, 3700: 2, 4800: 1, 4600: 4, 5000: 2, 2800: 1, 1500: 1}
+
+# Selection among runs: distance now dominates (was 2.0 / 3000 / 5000 / 50).
+BALANCE_PENALTY = 1.0
+DURATION_BALANCE_PENALTY = 300
+SHORTFALL_PENALTY = 500
 
 loc = pd.read_csv("locations.csv", encoding="utf-8-sig")
 columns = list(loc.columns)
@@ -23,107 +27,119 @@ ORG, ADDRESS, LAT, LON, DEMAND, FIXED, SMALL_ONLY = columns[1:8]
 T = (np.loadtxt("time_matrix_sec.csv", delimiter=",") / 60).round().astype(int)
 D = np.loadtxt("distance_matrix_m.csv", delimiter=",").round().astype(int)
 
-if MERGE_SAME_ADDRESS:
-    grouped = loc.groupby([LAT, LON], sort=False)
-    merged = []
-    for _, sub in grouped:
-        if 0 in sub.index:
-            continue
-        fixed_times = pd.to_numeric(sub[FIXED], errors="coerce")
-        merged.append({
-            columns[0]: int(sub.iloc[0, 0]),
-            ORG: " | ".join(sub[ORG].astype(str)),
-            ADDRESS: sub[ADDRESS].iloc[0],
-            LAT: sub[LAT].iloc[0],
-            LON: sub[LON].iloc[0],
-            DEMAND: int(sub[DEMAND].sum()),
-            FIXED: fixed_times.min() if fixed_times.notna().any() else np.nan,
-            SMALL_ONLY: int(sub[SMALL_ONLY].max()),
-            "service_objects": len(sub),
-        })
-    loc = pd.concat([loc.iloc[[0]], pd.DataFrame(merged)], ignore_index=True)
-    representatives = [0] + [int(row[columns[0]]) for row in merged]
-    T = T[np.ix_(representatives, representatives)]
-    D = D[np.ix_(representatives, representatives)]
-    print(f"Merged to {len(loc)-1} stops by coordinates.")
+# Each row is one stop; if the CSV has no service_objects column, count 1 object per stop.
+if "service_objects" not in loc.columns:
+    loc["service_objects"] = 1
 
 n = len(loc)
 demand = loc[DEMAND].astype(int).tolist()
 service = [0] + [SERVICE_MIN * int(count) for count in loc["service_objects"].iloc[1:]]
-capacities = [capacity for capacity, count in sorted(FLEET.items(), reverse=True) for _ in range(count)]
-vehicle_count = len(capacities)
-print(f"Stops: {n-1}; vehicles: {vehicle_count}; demand: {sum(demand)} kg; fleet capacity: {sum(capacities)} kg.")
+capacities = [cap for cap, count in FLEET.items() for _ in range(count)]
+print(f"Stops: {n-1}; vehicles: {len(capacities)}; demand: {sum(demand)} kg; fleet capacity: {sum(capacities)} kg.")
 
-manager = pywrapcp.RoutingIndexManager(n, vehicle_count, 0)
-routing = pywrapcp.RoutingModel(manager)
-distance_callback = routing.RegisterTransitCallback(lambda i, j: int(D[manager.IndexToNode(i)][manager.IndexToNode(j)]))
-routing.SetArcCostEvaluatorOfAllVehicles(distance_callback)
-routing.SetFixedCostOfAllVehicles(VEHICLE_FIXED)
-time_callback = routing.RegisterTransitCallback(lambda i, j: int(T[manager.IndexToNode(i)][manager.IndexToNode(j)] + service[manager.IndexToNode(i)]))
-routing.AddDimension(time_callback, HORIZON_MIN, HORIZON_MIN, False, "Time")
-time_dimension = routing.GetDimensionOrDie("Time")
-for node, row in loc.iterrows():
-    if node == 0:
-        continue
-    earliest = 0
-    latest = HORIZON_MIN
-    if pd.notna(row[FIXED]):
-        earliest = max(0, int(row[FIXED]) - SHIFT_START_MIN)
-        latest = earliest + FIXED_TOL_MIN
-    time_dimension.CumulVar(manager.NodeToIndex(node)).SetRange(earliest, latest)
-for vehicle in range(vehicle_count):
-    start, end = routing.Start(vehicle), routing.End(vehicle)
-    time_dimension.CumulVar(start).SetRange(0, HORIZON_MIN)
-    routing.solver().Add(time_dimension.CumulVar(end) - time_dimension.CumulVar(start) <= MAX_ROUTE_MIN)
-    routing.AddVariableMaximizedByFinalizer(time_dimension.CumulVar(start))
-    routing.AddVariableMinimizedByFinalizer(time_dimension.CumulVar(end))
+model = Model()
+depot_location = model.add_location(x=float(loc.loc[0, LON]), y=float(loc.loc[0, LAT]))
+depot = model.add_depot(location=depot_location, tw_early=0, tw_late=HORIZON_MIN)
+for capacity, count in FLEET.items():
+    model.add_vehicle_type(
+        num_available=count, capacity=[capacity, n if capacity == 1500 else 0], start_depot=depot, end_depot=depot,
+        tw_early=0, tw_late=HORIZON_MIN, shift_duration=MAX_ROUTE_MIN,
+        fixed_cost=VEHICLE_FIXED,
+    )
 
-demand_callback = routing.RegisterUnaryTransitCallback(lambda i: demand[manager.IndexToNode(i)])
-routing.AddDimensionWithVehicleCapacity(demand_callback, 0, capacities, True, "Load")
-load_dimension = routing.GetDimensionOrDie("Load")
-for vehicle in range(vehicle_count):
-    load_dimension.SetCumulVarSoftLowerBound(routing.End(vehicle), int(MIN_LOAD_SHARE * capacities[vehicle]), LOAD_PENALTY)
+client_locations = []
 for node in range(1, n):
-    routing.AddDisjunction([manager.NodeToIndex(node)], DROP_PENALTY)
-small_vehicles = [v for v, cap in enumerate(capacities) if cap == 1500]
-for node in loc.index[loc[SMALL_ONLY] == 1]:
-    routing.VehicleVar(manager.NodeToIndex(int(node))).SetValues(small_vehicles)
+    fixed = pd.to_numeric(pd.Series([loc.loc[node, FIXED]]), errors="coerce").iloc[0]
+    early, late = 8 * 60 - SHIFT_START_MIN, HORIZON_MIN
+    if pd.notna(fixed):
+        early = max(0, int(fixed) - SHIFT_START_MIN)
+        late = early + FIXED_TOL_MIN
+    required_small_truck = int(loc.loc[node, SMALL_ONLY]) == 1
+    client_location = model.add_location(x=float(loc.loc[node, LON]), y=float(loc.loc[node, LAT]))
+    client_locations.append(client_location)
+    model.add_client(
+        location=client_location, delivery=[int(demand[node]), int(required_small_truck)], service_duration=int(service[node]),
+        tw_early=early, tw_late=late, release_time=0, required=True,
+    )
 
-parameters = pywrapcp.DefaultRoutingSearchParameters()
-parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
-parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-parameters.time_limit.seconds = TIME_LIMIT_S
+locations = [depot_location, *client_locations]
+for i, frm in enumerate(locations):
+    for j, to in enumerate(locations):
+        if i != j:
+            model.add_edge(frm, to, distance=int(D[i, j]), duration=int(T[i, j]))
+
 print("Vehicle shift starts no earlier than 05:30; fixed delivery times are exact.", flush=True)
-solution = routing.SolveWithParameters(parameters)
-if not solution:
-    raise SystemExit("No solution found within the configured search limit.")
+solutions = []
+run_time = max(1, TIME_LIMIT_S // NUM_RUNS)
+for run in range(NUM_RUNS):
+    result = model.solve(stop=MaxRuntime(run_time), seed=SEED + run, display=True)
+    if result.best is not None and result.best.is_feasible():
+        solutions.append(result.best)
+if not solutions:
+    raise SystemExit("PyVRP did not find a feasible solution within the search limit.")
 
-route_headers = list(pd.read_csv("routes.csv", encoding="utf-8-sig", nrows=0).columns)
+def balance_score(candidate):
+    routes = candidate.routes()
+    capacities_by_type = list(FLEET)
+    load_shortfall = sum(
+        max(0, int(np.ceil(0.9 * capacities_by_type[route.vehicle_type()])) - int(route.delivery()[0]))
+        for route in routes
+    )
+    distances = np.asarray([route.distance() for route in routes], dtype=float)
+    durations = np.asarray([route.duration() for route in routes], dtype=float)
+    shortfall_penalty = SHORTFALL_PENALTY * sum(max(0, MIN_ROUTE_MIN - duration) for duration in durations)
+    route_cost = (
+        distances.sum()
+        + BALANCE_PENALTY * distances.std()
+        + DURATION_BALANCE_PENALTY * durations.std()
+        + shortfall_penalty
+    )
+    return load_shortfall, float(route_cost)
+
+solution = min(solutions, key=balance_score)
+route_distances = np.asarray([route.distance() for route in solution.routes()], dtype=float)
+route_durations = np.asarray([route.duration() for route in solution.routes()], dtype=float)
+load_shortfall_kg, route_objective = balance_score(solution)
+print(f"Selected objective: {route_objective:.0f}; load shortfall below 90%: {load_shortfall_kg} kg (distance {route_distances.sum()/1000:.1f} km, route-distance std dev {route_distances.std()/1000:.1f} km, route-duration mean {route_durations.mean():.0f} min, std dev {route_durations.std():.0f} min, range {route_durations.min():.0f}-{route_durations.max():.0f} min).")
+
+if not solution.is_feasible():
+    print(f"Best solution is infeasible: time warp={solution.time_warp()}, unplanned={solution.unplanned()}.")
+    for route in solution.routes():
+        print(f"Route type={route.vehicle_type()}, clients={route.num_clients()}, excess_load={route.excess_load()}, time_warp={route.time_warp()}.")
+    raise SystemExit("No feasible solution found; routes.csv was not written.")
+
+route_headers = ["vehicle", "capacity_kg", "order", "stop_id", "organization", "address", "arrival", "demand_kg"]
 rows = []
 total_distance = 0
-for vehicle in range(vehicle_count):
-    index = routing.Start(vehicle)
-    if routing.IsEnd(solution.Value(routing.NextVar(index))):
+served = set()
+vehicle_type_offsets = {}
+for route in solution.routes():
+    vehicle_type = route.vehicle_type()
+    capacity = list(FLEET)[vehicle_type]
+    vehicle_number = sum(FLEET[cap] for cap in list(FLEET)[:vehicle_type]) + vehicle_type_offsets.get(vehicle_type, 0)
+    vehicle_type_offsets[vehicle_type] = vehicle_type_offsets.get(vehicle_type, 0) + 1
+    activities = [activity for activity in route.schedule() if activity.is_client()]
+    nodes = [int(activity.idx) + 1 for activity in activities]
+    if not nodes:
         continue
-    load = 0
-    route_distance = 0
-    stops = []
-    while not routing.IsEnd(index):
-        node = manager.IndexToNode(index)
-        load += demand[node]
-        minute = solution.Min(time_dimension.CumulVar(index)) + SHIFT_START_MIN
-        stops.append((node, f"{minute//60:02d}:{minute%60:02d}"))
-        following = solution.Value(routing.NextVar(index))
-        route_distance += D[node][manager.IndexToNode(following)]
-        index = following
-    return_minute = solution.Min(time_dimension.CumulVar(index)) + SHIFT_START_MIN
+    route_distance = sum(int(D[a, b]) for a, b in zip([0, *nodes], [*nodes, 0]))
+    load = sum(demand[node] for node in nodes)
     total_distance += route_distance
-    print(f"Vehicle {vehicle+1} ({capacities[vehicle]} kg): load {load} kg ({load/capacities[vehicle]:.0%}), {route_distance/1000:.1f} km, return {return_minute//60:02d}:{return_minute%60:02d}")
-    for order, (node, arrival) in enumerate(stops):
-        rows.append({route_headers[0]: vehicle, route_headers[1]: capacities[vehicle], route_headers[2]: order,
-                     route_headers[3]: node, route_headers[4]: loc.loc[node, ORG], route_headers[5]: loc.loc[node, ADDRESS],
-                     route_headers[6]: arrival, route_headers[7]: demand[node]})
-unserved = [node for node in range(1, n) if solution.Value(routing.NextVar(manager.NodeToIndex(node))) == manager.NodeToIndex(node)]
+    stops = [(node, int(activity.start_time)) for node, activity in zip(nodes, activities)]
+    start_minute = int(next(activity for activity in route.schedule() if activity.is_depot()).start_time)
+    rows.append({"vehicle": vehicle_number, "capacity_kg": capacity, "order": 0, "stop_id": 0,
+                 "organization": loc.loc[0, ORG], "address": loc.loc[0, ADDRESS],
+                 "arrival": f"{(start_minute+SHIFT_START_MIN)//60:02d}:{(start_minute+SHIFT_START_MIN)%60:02d}",
+                 "demand_kg": 0})
+    served.update(nodes)
+    return_minute = int(route.end_time())
+    print(f"Vehicle {vehicle_number + 1} ({capacity} kg): load {load} kg ({load/capacity:.0%}), {route_distance/1000:.1f} km, return {(return_minute+SHIFT_START_MIN)//60:02d}:{(return_minute+SHIFT_START_MIN)%60:02d}")
+    for order, (node, minute) in enumerate(stops, start=1):
+        rows.append({"vehicle": vehicle_number, "capacity_kg": capacity, "order": order,
+                     "stop_id": node, "organization": loc.loc[node, ORG], "address": loc.loc[node, ADDRESS],
+                     "arrival": f"{(minute+SHIFT_START_MIN)//60:02d}:{(minute+SHIFT_START_MIN)%60:02d}",
+                     "demand_kg": demand[node]})
+unserved = [node for node in range(1, n) if node not in served]
 if unserved:
     print(f"Unserved stops: {len(unserved)}, {sum(demand[node] for node in unserved)} kg: {unserved}")
 pd.DataFrame(rows, columns=route_headers).to_csv("routes.csv", index=False, encoding="utf-8-sig")
